@@ -35,13 +35,22 @@ type DATA_BLOB struct {
 
 // Cookie - Items for a cookie
 type Cookie struct {
-	Domain         string
-	Key            string
-	Value          string
-	EncryptedValue []byte
+	Domain         string `json:"domain"`
+	ExpirationDate int64  `json:"expirationDate"`
+	HostOnly       bool   `json:"hostOnly"`
+	HttpOnly       bool   `json:"httpOnly"`
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	SameSite       string `json:"sameSite"`
+	Secure         bool   `json:"secure"`
+	Session        bool   `json:"session"`
+	Value          string `json:"value"`
+	StoreId        string `json:"storeId"`
+	ID             int    `json:"id"`
+	EncryptedValue []byte `json:"-"`
 }
 
-var profile string
+var profile, storeId string
 var aesKey []byte
 
 func ifThenElse(condition bool, a interface{}, b interface{}) interface{} {
@@ -67,17 +76,15 @@ func (b *DATA_BLOB) toByteArray() []byte {
 	return d
 }
 
-func (c *Cookie) decryptCookie() string {
+func (c *Cookie) decryptCookie() {
 	if c.Value > "" {
-		return c.Value
+		return
 	}
 
 	if len(c.EncryptedValue) > 0 {
 		var decryptedValue, _ = decryptValue(c.EncryptedValue)
-		return string(decryptedValue)
+		c.Value = string(decryptedValue)
 	}
-
-	return ""
 }
 
 func getAesGCMKey() []byte {
@@ -157,14 +164,16 @@ func getCookies(domain *string) (cookies []Cookie) {
 	var path, err = os.UserCacheDir()
 	var cookiesFile = fmt.Sprintf("%s\\Google\\Chrome\\User Data\\%s\\Cookies", path, profile)
 
-	db, err := sql.Open("sqlite3", cookiesFile)
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?cache=shared&mode=ro", cookiesFile))
 	if err != nil {
 		log.Fatal(err)
 	}
+	db.SetMaxOpenConns(1)
 	defer db.Close()
 
 	if domain != nil {
-		rows, err = db.Query("SELECT name, value, host_key, encrypted_value FROM cookies WHERE host_key = ?", fmt.Sprintf("%s", *domain))
+		rows, err = db.Query("SELECT host_key as Domain, expires_utc as ExpirationDate, is_httponly as HttpOnly, name as Name, path as Path, samesite as SameSite, "+
+			"is_secure as Secure, is_persistent as Session, value as Value, encrypted_value as EncryptedValue FROM cookies WHERE Domain LIKE ?", fmt.Sprintf("%%%s", *domain))
 	} else {
 		rows, err = db.Query("SELECT name, value, host_key, encrypted_value FROM cookies")
 	}
@@ -174,11 +183,26 @@ func getCookies(domain *string) (cookies []Cookie) {
 	}
 
 	defer rows.Close()
+	index := int(1)
 	for rows.Next() {
-		var name, value, hostKey string
-		var encryptedValue []byte
-		rows.Scan(&name, &value, &hostKey, &encryptedValue)
-		cookies = append(cookies, Cookie{hostKey, name, value, encryptedValue})
+
+		var cookie Cookie
+		var sameSite, secure, session, httpOnly int
+
+		rows.Scan(&cookie.Domain, &cookie.ExpirationDate, &httpOnly, &cookie.Name,
+			&cookie.Path, &sameSite, &secure, &session, &cookie.Value, &cookie.EncryptedValue)
+
+		cookie.SameSite = "unspecified"
+		cookie.Session = session == 0
+		cookie.HttpOnly = httpOnly == 1
+		cookie.Secure = secure == 1
+		cookie.StoreId = storeId
+		cookie.ID = index
+		cookie.ExpirationDate = (cookie.ExpirationDate / 1000000) - 11644473600
+		cookie.decryptCookie()
+
+		cookies = append(cookies, cookie)
+		index++
 	}
 
 	return
@@ -197,7 +221,7 @@ func getCanonicalCookieValue(domain string) string {
 
 	for index, cookie := range cookies {
 		lastCookie := index == len(cookies)-1
-		result += fmt.Sprintf("%s=%s%s", cookie.Key, cookie.decryptCookie(), ifThenElse(lastCookie, "", "; "))
+		result += fmt.Sprintf("%s=%s%s", cookie.Name, cookie.Value, ifThenElse(lastCookie, "", "; "))
 	}
 
 	return result
@@ -231,13 +255,15 @@ func getProfiles() (result map[int]string) {
 
 func main() {
 
-	var domainName string
+	var domainName, format string
 	profiles := false
 	profileIndex := 0
 
 	flag.BoolVar(&profiles, "profiles", false, "Lists the profile names and index to Chrome profiles under this account")
 	flag.IntVar(&profileIndex, "profile", 0, "Which Chrome profile index to extract cookie data from, uses Default when not specified")
 	flag.StringVar(&domainName, "domain", "", "Show the canonicalised cookie value for a specific domain")
+	flag.StringVar(&storeId, "storeId", "0", "The storeId to embed in exported JSON, incognito is storeId 1 in Chrome")
+	flag.StringVar(&format, "format", "json", "The output format: string, json (default)")
 
 	flag.Parse()
 
@@ -269,6 +295,11 @@ func main() {
 
 		aesKey = getAesGCMKey()
 
-		fmt.Printf("Cookies: %s\n", getCanonicalCookieValue(domainName))
+		if format == "json" {
+			result, _ := json.Marshal(getCookies(&domainName))
+			fmt.Print(string(result))
+		} else {
+			fmt.Printf("Cookies: %s\n", getCanonicalCookieValue(domainName))
+		}
 	}
 }
